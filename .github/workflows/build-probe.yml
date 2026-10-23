@@ -1,0 +1,73 @@
+name: build-hyb-and-test
+# Build hyb from main on Linux and run the adversarial soundness suite.
+# Artifact: hyb-linux-amd64 (static-ish binary), plus a run log of every
+# attack case: hyb check verdict + emitted Go + go run -race result.
+on:
+  workflow_dispatch:
+  push:
+    branches: [probe/**]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Go 1.26.9
+        run: |
+          curl -sL https://go.dev/dl/go1.26.9.linux-amd64.tar.gz | tar -C /usr/local -xzf -
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+
+      - name: Build hyb
+        run: |
+          cd compiler
+          cargo build --release
+          cp target/release/hyb "$GITHUB_WORKSPACE/hyb"
+
+      - name: Run adversarial suite
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/attack"
+          cd "$GITHUB_WORKSPACE/attack"
+          cp -r "$GITHUB_WORKSPACE"/tests/checker-corpus .
+          {
+            echo "=== hyb version: $(git -C "$GITHUB_WORKSPACE" rev-parse HEAD) ==="
+            for f in "$GITHUB_WORKSPACE"/attack-cases/*.hy; do
+              name=$(basename "$f")
+              echo ""
+              echo "########## $name ##########"
+              echo "--- hyb check ---"
+              "$GITHUB_WORKSPACE/hyb" check "$f" || true
+              echo "--- emit go + race ---"
+              "$GITHUB_WORKSPACE/hyb" build "$f" -o "$name.go" --emit-go || true
+              if ls "$name.go"* >/dev/null 2>&1; then
+                gofile=$(ls "$name.go"* | head -1)
+                mkdir -p "$name-race" && cp "$gofile" "$name-race/main.go"
+                cd "$name-race"
+                go mod init race >/dev/null 2>&1 || true
+                timeout 60 go run -race . 2>&1 | head -40 || true
+                cd ..
+              fi
+            done
+          } > "$GITHUB_WORKSPACE/attack-results.txt" 2>&1
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hyb-linux-amd64
+          path: hyb
+
+      - name: Upload attack results
+        uses: actions/upload-artifact@v4
+        with:
+          name: attack-results
+          path: attack-results.txt
